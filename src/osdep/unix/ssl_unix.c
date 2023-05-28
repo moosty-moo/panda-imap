@@ -53,7 +53,8 @@
  * ports (e.g., 993 for IMAP, 995 for POP3) and using TLS exclusively.
  */
 
-#define SSLCIPHERLIST "ALL:!SSLv2:!ADH:!EXP:!LOW"
+// no longer used, see ssl_env.c
+//#define SSLCIPHERLIST "ALL:!SSLv2:!ADH:!EXP:!LOW"
 
 /* SSL I/O stream */
 
@@ -73,7 +74,9 @@ typedef struct ssl_stream {
 static SSLSTREAM *ssl_start(TCPSTREAM *tstream,char *host,unsigned long flags);
 static char *ssl_start_work (SSLSTREAM *stream,char *host,unsigned long flags);
 static int ssl_open_verify (int ok,X509_STORE_CTX *ctx);
+#if OPENSSL_VERSION_NUMBER < 0x10100000
 static char *ssl_validate_cert (X509 *cert,char *host);
+#endif
 static long ssl_compare_hostnames (unsigned char *s,unsigned char *pat);
 static char *ssl_getline_work (SSLSTREAM *stream,unsigned long *size,
 			       long *contd);
@@ -234,14 +237,21 @@ static char *ssl_start_work (SSLSTREAM *stream,char *host,unsigned long flags)
   if (ssl_last_error) fs_give ((void **) &ssl_last_error);
   ssl_last_host = host;
   if (!(stream->context = SSL_CTX_new ((flags & NET_TLSCLIENT) ?
-				       TLSv1_client_method () :
+				       TLS_client_method () :
 				       SSLv23_client_method ())))
     return "SSL context failed";
   SSL_CTX_set_options (stream->context,0);
 				/* disable certificate validation? */
   if (flags & NET_NOVALIDATECERT)
     SSL_CTX_set_verify (stream->context,SSL_VERIFY_NONE,NIL);
-  else SSL_CTX_set_verify (stream->context,SSL_VERIFY_PEER,ssl_open_verify);
+  else {
+#if OPENSSL_VERSION_NUMBER >= 0x10100000
+      X509_VERIFY_PARAM *param = SSL_CTX_get0_param(stream->context);
+      X509_VERIFY_PARAM_set_hostflags(param, X509_CHECK_FLAG_NO_PARTIAL_WILDCARDS);
+      X509_VERIFY_PARAM_set1_host(param, host, 0);
+#endif
+      SSL_CTX_set_verify (stream->context,SSL_VERIFY_PEER,ssl_open_verify);
+  }
 				/* set default paths to CAs... */
   SSL_CTX_set_default_verify_paths (stream->context);
 				/* ...unless a non-standard path desired */
@@ -280,6 +290,7 @@ static char *ssl_start_work (SSLSTREAM *stream,char *host,unsigned long flags)
   if (SSL_write (stream->con,"",0) < 0)
     return ssl_last_error ? ssl_last_error : "SSL negotiation failed";
 				/* need to validate host names? */
+#if OPENSSL_VERSION_NUMBER < 0x10100000
   if (!(flags & NET_NOVALIDATECERT) &&
       (err = ssl_validate_cert (cert = SSL_get_peer_certificate (stream->con),
 				host))) {
@@ -289,6 +300,7 @@ static char *ssl_start_work (SSLSTREAM *stream,char *host,unsigned long flags)
     sprintf (tmp,"*%.128s: %.255s",err,cert ? cert->name : "???");
     return ssl_last_error = cpystr (tmp);
   }
+#endif
   return NIL;
 }
 
@@ -327,6 +339,7 @@ static int ssl_open_verify (int ok,X509_STORE_CTX *ctx)
  * Returns: NIL if validated, else string of error message
  */
 
+#if OPENSSL_VERSION_NUMBER < 0x10100000
 static char *ssl_validate_cert (X509 *cert,char *host)
 {
   int i,n;
@@ -356,6 +369,7 @@ static char *ssl_validate_cert (X509 *cert,char *host)
   else ret = "Unable to locate common name in certificate";
   return ret;
 }
+#endif
 
 /* Case-independent wildcard pattern match
  * Accepts: base string
@@ -691,6 +705,141 @@ char *ssl_start_tls (char *server)
   return NIL;
 }
 
+/**
+ * Define the SSL Protocol options for next function
+ */
+
+#define SSL_PROTOCOL_NONE      (0)
+#ifdef SSL_OP_NO_SSLv2
+#  define SSL_PROTOCOL_SSLV2   (1<<0)
+#else
+#  define SSL_PROTOCOL_SSLV2   0
+#endif
+#ifdef SSL_OP_NO_SSLv3
+#  define SSL_PROTOCOL_SSLV3   (1<<1)
+#else
+#  define SSL_PROTOCOL_SSLV3   0
+#endif
+/**
+#ifdef SSL_OP_NO_TLSv1
+#  define SSL_PROTOCOL_TLSV1   (1<<2)
+#else
+#  define SSL_PROTOCOL_TLSV1   0
+#endif
+***/
+#ifdef SSL_OP_NO_TLSv1_1
+#  define SSL_PROTOCOL_TLSV1_1 (1<<3)
+#else
+#  define SSL_PROTOCOL_TLSV1_1   0
+#endif
+#ifdef SSL_OP_NO_TLSv1_2
+#  define SSL_PROTOCOL_TLSV1_2 (1<<4)
+#else
+#  define SSL_PROTOCOL_TLSV1_2   0
+#endif
+#ifdef SSL_OP_NO_TLSv1_3
+#  define SSL_PROTOCOL_TLSV1_3 (1<<5)
+#else
+#  define SSL_PROTOCOL_TLSV1_3   0
+#endif
+
+#  define SSL_PROTOCOL_TLSV1   0
+
+#define SSL_PROTOCOL_ALL   (SSL_PROTOCOL_SSLV3|SSL_PROTOCOL_TLSV1|SSL_PROTOCOL_TLSV1_1|SSL_PROTOCOL_TLSV1_2|SSL_PROTOCOL_TLSV1_3)
+typedef int ssl_proto_t;
+
+/* Supporting function for parse of set ssl-protocol option */
+static const char *
+ssl_cmd_protocol_parse(const char *arg, ssl_proto_t *options)
+{
+    ssl_proto_t thisopt;
+    char *larg = NULL, *w;
+    static char errstr[2048];  /* Not thread safe ! */
+
+    *options = SSL_PROTOCOL_NONE;
+    if (arg == NULL)
+	return NULL;
+
+    larg = alloca(strlen(arg)+1);
+    if (larg == NULL)
+        return ("Not enought memory while parsing SSL protocol option");
+
+    strcpy(larg, arg);
+
+    while ((w = strsep(&larg, " \t")) != NULL) {
+        char action = '\0';
+
+	if (*w == '\0')
+	  continue;
+
+        if ((*w == '+') || (*w == '-'))
+            action = *(w++);
+
+        if (strcasecmp(w, "SSLv2") == 0) {
+#ifdef OPENSSL_NO_SSL2
+            if (action != '-') {
+                return "SSLv2 not supported by this version of OpenSSL";
+            }
+#endif
+            thisopt = SSL_PROTOCOL_SSLV2;
+        } else if (strcasecmp(w, "SSLv3") == 0) {
+#ifndef SSL_OP_NO_SSLv3
+            if (action != '-') {
+                return "SSLv3 not supported by this version of OpenSSL";
+            }
+#else
+            thisopt = SSL_PROTOCOL_SSLV3;
+#endif
+        } else if (strcasecmp(w, "TLSv1") == 0) {
+#ifndef SSL_OP_NO_TLSv1
+            if (action != '-') {
+                return "TLSv1 not supported by this version of OpenSSL";
+            }
+#else
+            thisopt = SSL_PROTOCOL_TLSV1;
+#endif
+        } else if (strcasecmp(w, "TLSv1.1") == 0) {
+#ifndef SSL_OP_NO_TLSv1_1
+            if (action != '-') {
+                return "TLSv1.1 not supported by this version of OpenSSL";
+            }
+#else
+            thisopt = SSL_PROTOCOL_TLSV1_1;
+#endif
+        } else if (strcasecmp(w, "TLSv1.2") == 0) {
+#ifndef SSL_OP_NO_TLSv1_2
+            if (action != '-') {
+                return "TLSv1.2 not supported by this version of OpenSSL";
+            }
+#else
+            thisopt = SSL_PROTOCOL_TLSV1_2;
+#endif
+        } else if (strcasecmp(w, "TLSv1.3") == 0) {
+#ifndef SSL_OP_NO_TLSv1_3
+            if (action != '-') {
+                return "TLSv1.3 not supported by this version of OpenSSL";
+            }
+#else
+            thisopt = SSL_PROTOCOL_TLSV1_3;
+#endif
+        } else if (strcasecmp(w, "all") == 0) {
+            thisopt = SSL_PROTOCOL_ALL;
+        } else {
+            snprintf(errstr, sizeof(errstr), "Illegal SSL protocol configured: '%s'", w);
+            return errstr;
+        }
+
+        if (action == '-')
+            *options &= ~thisopt;
+        else if (action == '+')
+            *options |= thisopt;
+        else
+            *options = thisopt;
+    }
+
+    return NULL;
+}
+
 /* Init server for SSL
  * Accepts: server name
  */
@@ -716,23 +865,72 @@ void ssl_server_init (char *server)
     if (stat (key,&sbuf)) strcpy (key,cert);
   }
 				/* create context */
+/***
   if (!(stream->context = SSL_CTX_new (start_tls ?
-				       TLSv1_server_method () :
+				       TLSv1_1_server_method () :
 				       SSLv23_server_method ())))
+****/
+	if (!(stream->context = SSL_CTX_new (SSLv23_server_method ())))
     syslog (LOG_ALERT,"Unable to create SSL context, host=%.80s",
 	    tcp_clienthost ());
   else {			/* set context options */
+    char *s;
+    const char *errstr;
+    ssl_proto_t protocol;
+    char *dhparams = NIL;
+
     SSL_CTX_set_options (stream->context,SSL_OP_ALL);
+				/* set protocols */
+    if ((s = (char *) mail_parameters (NIL,GET_SSLPROTOCOLS,NIL)) != NULL) {
+      errstr = ssl_cmd_protocol_parse(s, &protocol);
+#ifdef SSL_OP_NO_SSLv2
+      if (errstr != NULL || !(protocol & SSL_PROTOCOL_SSLV2)) {
+        SSL_CTX_set_options(stream->context, SSL_OP_NO_SSLv2);
+      }
+#endif
+#ifdef SSL_OP_NO_SSLv3
+      if (errstr != NULL || !(protocol & SSL_PROTOCOL_SSLV3)) {
+        SSL_CTX_set_options(stream->context, SSL_OP_NO_SSLv3);
+      }
+#endif
+#ifdef SSL_OP_NO_TLSv1
+      if (errstr != NULL || !(protocol & SSL_PROTOCOL_TLSV1)) {
+        SSL_CTX_set_options(stream->context, SSL_OP_NO_TLSv1);
+      }
+#endif
+#ifdef SSL_OP_NO_TLSv1_1
+      if (errstr != NULL || !(protocol & SSL_PROTOCOL_TLSV1_1)) {
+        SSL_CTX_set_options(stream->context, SSL_OP_NO_TLSv1_1);
+      }
+#endif
+#ifdef SSL_OP_NO_TLSv1_2
+      if (errstr != NULL || !(protocol & SSL_PROTOCOL_TLSV1_2)) {
+        SSL_CTX_set_options(stream->context, SSL_OP_NO_TLSv1_2);
+      }
+#endif
+#ifdef SSL_OP_NO_TLSv1_3
+      if (errstr != NULL || !(protocol & SSL_PROTOCOL_TLSV1_3)) {
+        SSL_CTX_set_options(stream->context, SSL_OP_NO_TLSv1_3);
+      }
+#endif
+      if (errstr != NULL || !(protocol &  SSL_OP_NO_RENEGOTIATION)) {
+        SSL_CTX_set_options(stream->context,  SSL_OP_NO_RENEGOTIATION);
+      }
+    }
+    if (s != NULL && errstr != NULL)
+      syslog (LOG_ALERT,"Unable to set protocol (host=%.80s): %s",
+              tcp_clienthost (), errstr);
 				/* set cipher list */
-    if (!SSL_CTX_set_cipher_list (stream->context,SSLCIPHERLIST))
+    else if ((s = (char *) mail_parameters (NIL,GET_SSLCIPHERLIST,NIL)) != NULL && !SSL_CTX_set_cipher_list (stream->context,s))
       syslog (LOG_ALERT,"Unable to set cipher list %.80s, host=%.80s",
-	      SSLCIPHERLIST,tcp_clienthost ());
+              s,tcp_clienthost ());
+				/* want to send client certificate? */
 				/* load certificate */
     else if (!SSL_CTX_use_certificate_chain_file (stream->context,cert))
       syslog (LOG_ALERT,"Unable to load certificate from %.80s, host=%.80s",
 	      cert,tcp_clienthost ());
 				/* load key */
-    else if (!(SSL_CTX_use_RSAPrivateKey_file (stream->context,key,
+    else if (!(SSL_CTX_use_PrivateKey_file (stream->context,key,
 					       SSL_FILETYPE_PEM)))
       syslog (LOG_ALERT,"Unable to load private key from %.80s, host=%.80s",
 	      key,tcp_clienthost ());
@@ -740,6 +938,40 @@ void ssl_server_init (char *server)
     else {			/* generate key if needed */
       if (SSL_CTX_need_tmp_RSA (stream->context))
 	SSL_CTX_set_tmp_rsa_callback (stream->context,ssl_genkey);
+
+	dhparams= (char *) mail_parameters (NIL,GET_SSLDHPARAMS,NIL);
+	if (dhparams) {	/* we got a DHparams file, try processing it */
+	  BIO *bio;
+	  DH *dh = NIL;
+
+	  if ((bio = BIO_new_file(dhparams, "r")) != NULL) {
+		dh = PEM_read_bio_DHparams(bio, NULL, NULL, NULL);
+		BIO_free(bio);
+		  if (dh == NULL ) {
+			unsigned long err;
+
+			err = ERR_get_error();
+			syslog(LOG_WARNING,
+			  "STARTTLS=%s, error: cannot read DH parameters(%s): %s",
+			  tcp_clienthost(), dhparams,
+			  ERR_error_string(err, NULL));
+		  }
+		}
+		else {
+		  syslog(LOG_WARNING,
+		    "STARTTLS=%s, error: BIO_new_file(%s) failed",
+		    tcp_clienthost(), dhparams);
+		}
+
+		if (dh != NULL) {
+		  SSL_CTX_set_tmp_dh(stream->context, dh);
+
+		  /* important to avoid small subgroup attacks */
+		  SSL_CTX_set_options(stream->context, SSL_OP_SINGLE_DH_USE);
+		  DH_free(dh);
+		}
+	}
+
 				/* create new SSL connection */
       if (!(stream->con = SSL_new (stream->context)))
 	syslog (LOG_ALERT,"Unable to create SSL connection, host=%.80s",
